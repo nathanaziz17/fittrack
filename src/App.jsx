@@ -220,6 +220,16 @@ const CSS = `
   .tmpl-set-tag { background: var(--surface2); border-radius: 6px; padding: 4px 8px; font-size: 12px; font-weight: 600; color: var(--accent); white-space: nowrap; }
   .prog-bar-outer { height: 4px; background: var(--surface2); border-radius: 2px; margin-top: 10px; overflow: hidden; }
   .prog-bar-inner { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s ease; }
+  /* INLINE REST TIMER */
+  .rest-banner { position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 480px; background: #0a0a0a; border-bottom: 2px solid var(--accent); z-index: 250; padding: 12px 20px; display: flex; align-items: center; gap: 14px; }
+  .rest-ring { position: relative; width: 56px; height: 56px; flex-shrink: 0; }
+  .rest-ring svg { transform: rotate(-90deg); }
+  .rest-time { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: 'Bebas Neue', sans-serif; font-size: 20px; color: var(--accent); }
+  .rest-info { flex: 1; }
+  .rest-label { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .rest-next { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 2px; }
+  .rest-done { background: var(--accent); color: #000; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 6px; border: none; cursor: pointer; font-family: 'DM Sans', sans-serif; white-space: nowrap; }
+  .rest-skip { background: none; border: 1px solid var(--border); color: var(--muted); font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans', sans-serif; white-space: nowrap; margin-top: 4px; }
   /* SCANNER */
   .scanner-overlay { position: fixed; inset: 0; background: #000; z-index: 300; display: flex; flex-direction: column; }
   .scanner-video { width: 100%; height: 100%; object-fit: cover; }
@@ -492,35 +502,205 @@ function TemplateBuilder({ initial, onSave, onClose }) {
 
 // ─── ACTIVE WORKOUT (from template or blank) ──────────────────────────────────
 const TEMPLATE_ICONS = ["💪","🏋️","🦵","🔥","⚡","🎯","🏃","🤸","🥊","🧠"];
+// ─── PER-SET REST TIMER ───────────────────────────────────────────────────────
+const MOTIVATIONAL_QUOTES = [
+  "Let's get back to work 💪",
+  "Let's go! 💪",
+  "Rest over. Back to it! 🔥",
+  "Time to grind! ⚡",
+  "Get after it! 💪",
+  "No days off! 🔥",
+  "You're not done yet! ⚡",
+  "Stay hungry! 💪",
+  "Keep pushing! 🔥",
+  "One more set. Let's go! ⚡",
+];
+const PRESET_RESTS = [30, 45, 60, 90, 120, 150, 180];
+const fmtMins = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
+function ringBell() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const strikes = [0, 0.55, 1.1]; // three dings
+    strikes.forEach(startTime => {
+      // Main bell tone
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(880, ctx.currentTime + startTime);
+      osc.frequency.exponentialRampToValueAtTime(660, ctx.currentTime + startTime + 0.08);
+      gain.gain.setValueAtTime(0, ctx.currentTime + startTime);
+      gain.gain.linearRampToValueAtTime(1.2, ctx.currentTime + startTime + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startTime + 2.2);
+      osc.start(ctx.currentTime + startTime);
+      osc.stop(ctx.currentTime + startTime + 2.2);
+
+      // Overtone layer (gives it that metallic ring)
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+      osc2.type = "sine";
+      osc2.frequency.setValueAtTime(1760, ctx.currentTime + startTime);
+      osc2.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + startTime + 0.06);
+      gain2.gain.setValueAtTime(0, ctx.currentTime + startTime);
+      gain2.gain.linearRampToValueAtTime(0.5, ctx.currentTime + startTime + 0.004);
+      gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startTime + 1.6);
+      osc2.start(ctx.currentTime + startTime);
+      osc2.stop(ctx.currentTime + startTime + 1.6);
+
+      // Impact transient (clang attack)
+      const noise = ctx.createOscillator();
+      const noiseGain = ctx.createGain();
+      noise.connect(noiseGain);
+      noiseGain.connect(ctx.destination);
+      noise.type = "sawtooth";
+      noise.frequency.setValueAtTime(220, ctx.currentTime + startTime);
+      noiseGain.gain.setValueAtTime(0.8, ctx.currentTime + startTime);
+      noiseGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startTime + 0.08);
+      noise.start(ctx.currentTime + startTime);
+      noise.stop(ctx.currentTime + startTime + 0.08);
+    });
+  } catch (e) { /* silently fail if audio not supported */ }
+}
+
+function SetTimer({ shouldStart }) {
+  const [duration, setDuration] = useState(45);
+  const [remaining, setRemaining] = useState(45);
+  const [running, setRunning] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [quote, setQuote] = useState("");
+  const ref = useRef();
+  const prevShouldStart = useRef(false);
+
+  useEffect(() => {
+    if (shouldStart && !prevShouldStart.current) {
+      clearInterval(ref.current);
+      setRemaining(duration);
+      setFinished(false);
+      setRunning(true);
+    }
+    if (!shouldStart && prevShouldStart.current) {
+      clearInterval(ref.current);
+      setRunning(false);
+      setFinished(false);
+      setRemaining(duration);
+    }
+    prevShouldStart.current = shouldStart;
+  }, [shouldStart]);
+
+  useEffect(() => {
+    if (running) {
+      ref.current = setInterval(() => {
+        setRemaining(r => {
+          if (r <= 1) {
+            clearInterval(ref.current);
+            setRunning(false);
+            setFinished(true);
+            setQuote(MOTIVATIONAL_QUOTES[Math.floor(Math.random() * MOTIVATIONAL_QUOTES.length)]);
+            ringBell();
+            return 0;
+          }
+          return r - 1;
+        });
+      }, 1000);
+    } else { clearInterval(ref.current); }
+    return () => clearInterval(ref.current);
+  }, [running]);
+
+  const changeDuration = (secs) => {
+    setDuration(secs);
+    if (!running && !finished) setRemaining(secs);
+  };
+
+  const reset = () => {
+    clearInterval(ref.current);
+    setRunning(false);
+    setFinished(false);
+    setRemaining(duration);
+    prevShouldStart.current = false;
+  };
+
+  const again = () => { setRemaining(duration); setRunning(true); setFinished(false); prevShouldStart.current = true; };
+
+  const pct = duration > 0 ? remaining / duration : 0;
+  const barColor = finished ? "var(--green)" : remaining <= 10 ? "#ff6b35" : remaining <= 20 ? "#ffcc00" : "#47c5ff";
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 8px" }}>
+      <select value={duration} onChange={e => changeDuration(Number(e.target.value))}
+        style={{ width: 54, flexShrink: 0, background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--muted)", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, padding: "4px 2px", cursor: "pointer", textAlign: "center" }}>
+        {PRESET_RESTS.map(s => <option key={s} value={s}>{fmtMins(s)}</option>)}
+      </select>
+
+      <div style={{ flex: 1, position: "relative", height: 36, background: "var(--surface2)", borderRadius: 8, overflow: "hidden", border: `1px solid ${running ? barColor : finished ? "var(--green)" : "var(--border)"}`, transition: "border-color 0.3s" }}>
+        <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${pct * 100}%`, background: `${barColor}33`, borderRadius: 8, transition: "width 1s linear, background 0.4s" }} />
+        <div style={{ position: "absolute", top: 0, bottom: 0, left: `calc(${pct * 100}% - 2px)`, width: 3, background: barColor, borderRadius: 2, opacity: running ? 1 : 0, transition: "left 1s linear, background 0.4s, opacity 0.3s", boxShadow: `0 0 6px ${barColor}` }} />
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Bebas Neue', sans-serif", fontSize: finished ? 13 : 18, color: finished ? "var(--green)" : running ? "var(--text)" : "var(--muted)", letterSpacing: "0.05em", lineHeight: 1, zIndex: 1, padding: "0 8px", textAlign: "center" }}>
+          {finished ? quote : fmtMins(remaining)}
+        </div>
+      </div>
+
+      {finished ? (
+        <button onClick={again} style={{ flexShrink: 0, background: "rgba(68,255,136,0.15)", border: "1px solid var(--green)", borderRadius: 6, color: "var(--green)", padding: "6px 10px", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Again</button>
+      ) : running ? (
+        <button onClick={reset} style={{ flexShrink: 0, background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--muted)", padding: "6px 10px", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Reset</button>
+      ) : (
+        <button onClick={() => { setRemaining(duration); setRunning(true); prevShouldStart.current = true; }} style={{ flexShrink: 0, background: "var(--accent)", color: "#000", border: "none", borderRadius: 6, padding: "6px 10px", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Start</button>
+      )}
+    </div>
+  );
+}
+
+// ─── ACTIVE WORKOUT ───────────────────────────────────────────────────────────
 function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCancel, isQuickStart }) {
   const [exercises, setExercises] = useState(
     initExercises.map(e => ({
       id: Date.now() + Math.random(),
       name: e.name,
-      sets: e.sets.map(s => ({ w: String(s.w || ""), r: String(s.r || ""), done: false, targetW: s.w, targetR: s.r }))
+      sets: e.sets.map(s => ({ w: String(s.w || ""), r: String(s.r || ""), done: false, targetW: s.w, targetR: s.r, prevW: s.prevW ?? null, prevR: s.prevR ?? null }))
     }))
   );
   const [picker, setPicker] = useState(false);
-  const [timer, setTimer] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [workoutName, setWorkoutName] = useState(initName);
-  const [saveModal, setSaveModal] = useState(false); // show save-as-template prompt
+  const [saveModal, setSaveModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
   const [tmplName, setTmplName] = useState("");
   const [tmplIcon, setTmplIcon] = useState("💪");
-  const ref = useRef();
+  const elapsedRef = useRef();
 
   useEffect(() => {
-    ref.current = setInterval(() => setElapsed(e => e + 1), 1000);
-    return () => clearInterval(ref.current);
+    elapsedRef.current = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(elapsedRef.current);
   }, []);
 
-  const addExercise = name => setExercises(ex => [...ex, { id: Date.now(), name, sets: [{ w: "", r: "", done: false, targetW: null, targetR: null }] }]);
-  const addSet = id => setExercises(ex => ex.map(e => e.id === id ? { ...e, sets: [...e.sets, { w: "", r: "", done: false, targetW: null, targetR: null }] } : e));
+  const addExercise = name => setExercises(ex => [...ex, { id: Date.now(), name, sets: [{ w: "", r: "", done: false, targetW: null, targetR: null, prevW: null, prevR: null }] }]);
+  const addSet = id => setExercises(ex => ex.map(e => e.id === id ? { ...e, sets: [...e.sets, { w: "", r: "", done: false, targetW: null, targetR: null, prevW: null, prevR: null }] } : e));
   const removeSet = (id, si) => setExercises(ex => ex.map(e => e.id === id ? { ...e, sets: e.sets.filter((_, i) => i !== si) } : e));
   const updateSet = (id, si, field, val) => setExercises(ex => ex.map(e => e.id === id ? { ...e, sets: e.sets.map((s, i) => i === si ? { ...s, [field]: val } : s) } : e));
   const removeExercise = id => setExercises(ex => ex.filter(e => e.id !== id));
+
+  const tickSet = (exId, si) => {
+    setExercises(exList => exList.map(e => {
+      if (e.id !== exId) return e;
+      return {
+        ...e,
+        sets: e.sets.map((s, i) => {
+          if (i !== si) return s;
+          const newDone = !s.done;
+          return {
+            ...s,
+            done: newDone,
+            w: (!s.w && s.targetW !== null && newDone) ? String(s.targetW) : s.w,
+            r: (!s.r && s.targetR !== null && newDone) ? String(s.targetR) : s.r,
+          };
+        })
+      };
+    }));
+  };
 
   const totalSets = exercises.reduce((a, e) => a + e.sets.length, 0);
   const doneSets = exercises.reduce((a, e) => a + e.sets.filter(s => s.done).length, 0);
@@ -533,10 +713,7 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
       duration: Math.floor(elapsed / 60)
     };
     if (isQuickStart && exercises.length > 0) {
-      // Pause and ask if they want to save as template
-      setTmplName(workoutName);
-      setPendingEntry(entry);
-      setSaveModal(true);
+      setTmplName(workoutName); setPendingEntry(entry); setSaveModal(true);
     } else {
       onFinish(entry, exercises);
     }
@@ -545,15 +722,7 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
   const confirmSaveTemplate = (save) => {
     setSaveModal(false);
     if (save) {
-      const template = {
-        id: Date.now(),
-        name: tmplName.trim() || workoutName,
-        icon: tmplIcon,
-        exercises: exercises.map(e => ({
-          name: e.name,
-          sets: e.sets.map(s => ({ w: parseFloat(s.w) || 0, r: parseInt(s.r) || 0 }))
-        }))
-      };
+      const template = { id: Date.now(), name: tmplName.trim() || workoutName, icon: tmplIcon, exercises: exercises.map(e => ({ name: e.name, sets: e.sets.map(s => ({ w: parseFloat(s.w) || 0, r: parseInt(s.r) || 0 })) })) };
       onFinish(pendingEntry, exercises, template);
     } else {
       onFinish(pendingEntry, exercises, null);
@@ -563,6 +732,7 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
   return (
     <div className="app">
       <style>{CSS}</style>
+
       <div className="page-header" style={{ paddingBottom: 8 }}>
         <div style={{ flex: 1 }}>
           <div className="page-title">WORKOUT<span className="accent-dot">.</span></div>
@@ -584,60 +754,56 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
       </div>
 
       <div style={{ padding: "0 20px" }}>
-        {exercises.map(ex => {
-          const exDone = ex.sets.filter(s => s.done).length;
-          const exTotal = ex.sets.length;
-          const exComplete = exDone === exTotal;
+        {exercises.map((ex, exIdx) => {
+          const exComplete = ex.sets.every(s => s.done);
+          const isLastExercise = exIdx === exercises.length - 1;
           return (
             <div key={ex.id} className="exercise-card" style={exComplete ? { borderColor: "rgba(68,255,136,0.3)" } : {}}>
               <div className="ex-name">
-                <span style={exComplete ? { color: "var(--green)" } : {}}>
-                  {exComplete && "✓ "}{ex.name}
-                </span>
+                <span style={exComplete ? { color: "var(--green)" } : {}}>{exComplete && "✓ "}{ex.name}</span>
                 <button className="btn btn-danger btn-sm" onClick={() => removeExercise(ex.id)}>✕</button>
               </div>
-              <div className="sets-grid" style={{ marginBottom: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "28px 1fr 1fr 1fr 32px", gap: 6, marginBottom: 8, alignItems: "center" }}>
                 <div className="col-header">SET</div>
+                <div className="col-header">PREV</div>
                 <div className="col-header">KG</div>
                 <div className="col-header">REPS</div>
                 <div className="col-header">✓</div>
               </div>
-              {ex.sets.map((s, i) => (
-                <div key={i} className="sets-grid" style={{ marginBottom: 6 }}>
-                  <div className="set-num" style={{ cursor: "pointer", color: "var(--danger)" }} onClick={() => removeSet(ex.id, i)}>{i + 1}</div>
-                  <input className="set-input" type="number"
-                    placeholder={s.targetW !== null ? String(s.targetW) : "0"}
-                    value={s.w}
-                    onChange={e => updateSet(ex.id, i, "w", e.target.value)}
-                    style={s.done ? { opacity: 0.5 } : {}} />
-                  <input className="set-input" type="number"
-                    placeholder={s.targetR !== null ? String(s.targetR) : "0"}
-                    value={s.r}
-                    onChange={e => updateSet(ex.id, i, "r", e.target.value)}
-                    style={s.done ? { opacity: 0.5 } : {}} />
-                  <button className={`set-check ${s.done ? "done" : ""}`} onClick={() => {
-                    // auto-fill from placeholder if empty
-                    const filled = {
-                      w: s.w || (s.targetW !== null ? String(s.targetW) : ""),
-                      r: s.r || (s.targetR !== null ? String(s.targetR) : ""),
-                    };
-                    updateSet(ex.id, i, "done", !s.done);
-                    if (!s.done) {
-                      if (!s.w && s.targetW !== null) updateSet(ex.id, i, "w", String(s.targetW));
-                      if (!s.r && s.targetR !== null) updateSet(ex.id, i, "r", String(s.targetR));
-                    }
-                  }}>
-                    {s.done && <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="#000" strokeWidth="2" strokeLinecap="round" /></svg>}
-                  </button>
-                </div>
-              ))}
+              {ex.sets.map((s, si) => {
+                const isLastSet = si === ex.sets.length - 1;
+                const showTimer = !(isLastSet && isLastExercise);
+                const hasPrev = s.prevW !== null && s.prevR !== null;
+                return (
+                  <div key={si}>
+                    <div style={{ display: "grid", gridTemplateColumns: "28px 1fr 1fr 1fr 32px", gap: 6, marginBottom: 6, alignItems: "center" }}>
+                      <div className="set-num" style={{ cursor: "pointer", color: "var(--danger)" }} onClick={() => removeSet(ex.id, si)}>{si + 1}</div>
+                      {/* Previous */}
+                      <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600, textAlign: "center", lineHeight: 1.3 }}>
+                        {hasPrev ? `${s.prevW}kg ×${s.prevR}` : <span style={{ color: "var(--border)" }}>—</span>}
+                      </div>
+                      <input className="set-input" type="number"
+                        placeholder={s.targetW !== null ? String(s.targetW) : "0"}
+                        value={s.w} onChange={e => updateSet(ex.id, si, "w", e.target.value)}
+                        style={s.done ? { opacity: 0.5 } : {}} />
+                      <input className="set-input" type="number"
+                        placeholder={s.targetR !== null ? String(s.targetR) : "0"}
+                        value={s.r} onChange={e => updateSet(ex.id, si, "r", e.target.value)}
+                        style={s.done ? { opacity: 0.5 } : {}} />
+                      <button className={`set-check ${s.done ? "done" : ""}`} onClick={() => tickSet(ex.id, si)}>
+                        {s.done && <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="#000" strokeWidth="2" strokeLinecap="round" /></svg>}
+                      </button>
+                    </div>
+                    {showTimer && <SetTimer key={`timer-${ex.id}-${si}`} shouldStart={s.done} />}
+                  </div>
+                );
+              })}
               <button className="btn btn-secondary btn-sm" style={{ marginTop: 4 }} onClick={() => addSet(ex.id)}>+ Add Set</button>
             </div>
           );
         })}
 
         <button className="btn btn-secondary" style={{ width: "100%", marginBottom: 10 }} onClick={() => setPicker(true)}>+ Add Exercise</button>
-        <button className="btn btn-secondary" style={{ width: "100%", marginBottom: 10, borderColor: "var(--accent2)", color: "var(--accent2)" }} onClick={() => setTimer(true)}>⏱ Rest Timer</button>
         <button className="btn btn-primary" style={{ marginBottom: 10, ...(pct === 100 ? { background: "var(--green)", color: "#000" } : {}) }} onClick={finish}>
           {pct === 100 ? "✓ FINISH WORKOUT" : `FINISH WORKOUT (${pct}%)`}
         </button>
@@ -645,23 +811,17 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
       </div>
 
       {picker && <ExercisePicker onAdd={addExercise} onClose={() => setPicker(false)} />}
-      {timer && <RestTimer onClose={() => setTimer(false)} />}
 
-      {/* Save as template modal */}
       {saveModal && (
         <div className="modal-overlay">
           <div className="modal">
             <div style={{ textAlign: "center", marginBottom: 6, fontSize: 36 }}>🎉</div>
             <div className="modal-title" style={{ textAlign: "center" }}>Workout Done!</div>
-            <div style={{ fontSize: 14, color: "var(--muted)", textAlign: "center", marginBottom: 20 }}>
-              Save this as a template so you can load it up next time?
-            </div>
-
+            <div style={{ fontSize: 14, color: "var(--muted)", textAlign: "center", marginBottom: 20 }}>Save this as a template so you can load it up next time?</div>
             <div className="input-group">
               <label className="input-label">Template Name</label>
               <input className="text-input" value={tmplName} onChange={e => setTmplName(e.target.value)} placeholder="e.g. Push Day" />
             </div>
-
             <div className="input-group">
               <label className="input-label">Icon</label>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -673,17 +833,11 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
                 ))}
               </div>
             </div>
-
             <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 16 }}>
               {exercises.length} exercises · {exercises.reduce((a, e) => a + e.sets.length, 0)} sets — weights saved as targets
             </div>
-
-            <button className="btn btn-primary" style={{ marginBottom: 10 }} onClick={() => confirmSaveTemplate(true)}>
-              ✓ Save as Template
-            </button>
-            <button className="btn btn-secondary" style={{ width: "100%" }} onClick={() => confirmSaveTemplate(false)}>
-              No thanks, just finish
-            </button>
+            <button className="btn btn-primary" style={{ marginBottom: 10 }} onClick={() => confirmSaveTemplate(true)}>✓ Save as Template</button>
+            <button className="btn btn-secondary" style={{ width: "100%" }} onClick={() => confirmSaveTemplate(false)}>No thanks, just finish</button>
           </div>
         </div>
       )}
@@ -692,6 +846,8 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
 }
 
 // ─── WORKOUT PAGE ─────────────────────────────────────────────────────────────
+
+
 function WorkoutPage({ history, setHistory }) {
   const [view, setView] = useState("home"); // home | active | builder | editTemplate | detail
   const [templates, setTemplates] = useState(DEFAULT_TEMPLATES);
@@ -701,11 +857,19 @@ function WorkoutPage({ history, setHistory }) {
   const [selectedSession, setSelectedSession] = useState(null);
 
   const startFromTemplate = tmpl => {
-    // Deep-copy the template exercises so the live workout is fully isolated
-    const exercises = tmpl.exercises.map(e => ({
-      name: e.name,
-      sets: e.sets.map(s => ({ ...s }))
-    }));
+    // Find the most recent history entry with this template name for "Previous" column
+    const prevSession = history.find(h => h.name === tmpl.name);
+    const exercises = tmpl.exercises.map(e => {
+      const prevEx = prevSession?.exercises.find(pe => pe.name === e.name);
+      return {
+        name: e.name,
+        sets: e.sets.map((s, si) => ({
+          ...s,
+          prevW: prevEx?.sets[si]?.w ?? null,
+          prevR: prevEx?.sets[si]?.r ?? null,
+        }))
+      };
+    });
     setActiveConfig({ name: tmpl.name, exercises, templateId: tmpl.id });
     setView("active");
   };
