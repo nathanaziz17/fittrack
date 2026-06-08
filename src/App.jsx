@@ -287,6 +287,24 @@ function today() { return new Date().toISOString().split("T")[0]; }
 function monthLabel(d) { return new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short" }); }
 function calcVolume(ex) { return ex.sets.reduce((a, s) => a + (s.w || 0) * (s.r || 0), 0); }
 
+// ─── PERSISTENT STORAGE HOOK ──────────────────────────────────────────────────
+function useLocalStorage(key, initialValue) {
+  const [storedValue, setStoredValue] = useState(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch { return initialValue; }
+  });
+  const setValue = useCallback(value => {
+    try {
+      const valueToStore = value instanceof Function ? value(storedValue) : value;
+      setStoredValue(valueToStore);
+      window.localStorage.setItem(key, JSON.stringify(valueToStore));
+    } catch (e) { console.warn("localStorage error:", e); }
+  }, [key, storedValue]);
+  return [storedValue, setValue];
+}
+
 // ─── MINI CHART ───────────────────────────────────────────────────────────────
 function LineChart({ data, color = "#e8ff47", label = "kg" }) {
   if (!data || data.length < 2) return <div className="empty-state">Not enough data yet</div>;
@@ -425,7 +443,7 @@ function TemplateBuilder({ initial, onSave, onClose }) {
   const removeExercise = id => setExercises(ex => ex.filter(e => e.id !== id));
 
   const save = () => {
-    if (!name.trim() || exercises.length === 0) return;
+    if (!name.trim()) return;
     onSave({
       id: initial?.id || Date.now(),
       name: name.trim(),
@@ -849,8 +867,8 @@ function ActiveWorkout({ workoutName: initName, initExercises, onFinish, onCance
 
 
 function WorkoutPage({ history, setHistory }) {
-  const [view, setView] = useState("home"); // home | active | builder | editTemplate | detail
-  const [templates, setTemplates] = useState(DEFAULT_TEMPLATES);
+  const [view, setView] = useState("home");
+  const [templates, setTemplates] = useLocalStorage("fittrack_templates", DEFAULT_TEMPLATES);
   const [activeConfig, setActiveConfig] = useState(null);
   const [editingTemplate, setEditingTemplate] = useState(null);
   const [workoutTab, setWorkoutTab] = useState("templates");
@@ -932,7 +950,6 @@ function WorkoutPage({ history, setHistory }) {
     <div>
       <div className="page-header">
         <div className="page-title">WORKOUTS<span className="accent-dot">.</span></div>
-        <button className="btn btn-primary btn-sm" onClick={startBlank}>+ Quick Start</button>
       </div>
 
       {/* Tabs */}
@@ -945,6 +962,17 @@ function WorkoutPage({ history, setHistory }) {
       {/* ── TEMPLATES TAB ── */}
       {workoutTab === "templates" && (
         <>
+          {/* Start New Workout — top */}
+          <div style={{ padding: "0 20px 8px" }}>
+            <button className="btn btn-primary" style={{ width: "100%" }} onClick={startBlank}>🏋️ Start New Workout</button>
+            <div style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", marginTop: 6 }}>Start blank and add exercises as you go</div>
+          </div>
+
+          {/* Create New Template */}
+          <div style={{ padding: "4px 20px 12px" }}>
+            <button className="btn btn-secondary" style={{ width: "100%", borderStyle: "dashed" }} onClick={() => setView("builder")}>+ Create New Template</button>
+          </div>
+
           {templates.length === 0 && (
             <div className="empty-state">
               <div style={{ fontSize: 40, marginBottom: 12 }}>📋</div>
@@ -959,7 +987,6 @@ function WorkoutPage({ history, setHistory }) {
                 <div className="template-info">
                   <div className="template-name">{tmpl.name}</div>
                   <div className="template-meta">{tmpl.exercises.length} exercises · {totalSets} sets</div>
-                  {/* Exercise preview */}
                   <div style={{ marginTop: 6, display: "flex", gap: 4, flexWrap: "wrap" }}>
                     {tmpl.exercises.slice(0, 3).map((e, i) => (
                       <span key={i} style={{ fontSize: 10, background: "var(--surface2)", color: "var(--muted)", borderRadius: 4, padding: "2px 6px" }}>{e.name}</span>
@@ -975,9 +1002,6 @@ function WorkoutPage({ history, setHistory }) {
               </div>
             );
           })}
-          <div style={{ padding: "4px 20px 12px" }}>
-            <button className="btn btn-secondary" style={{ width: "100%", borderStyle: "dashed" }} onClick={() => setView("builder")}>+ Create New Template</button>
-          </div>
         </>
       )}
 
@@ -1223,91 +1247,187 @@ function ProductConfirm({ product, onAdd, onClose }) {
 }
 
 // ─── NUTRITION PAGE ───────────────────────────────────────────────────────────
-function NutritionPage({ log, setLog, macroTargets }) {
-  const [modal, setModal] = useState(false);
+function NutritionPage({ log: todayLog, setLog: setTodayLog, macroTargets: initialTargets }) {
+  const [weekLogs, setWeekLogs] = useLocalStorage("fittrack_weeklogs", {});
+  const [selectedDate, setSelectedDate] = useState(today());
+  const [addModal, setAddModal] = useState(false);
+  const [activeMeal, setActiveMeal] = useState("Breakfast");
+  const [showManual, setShowManual] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [scanState, setScanState] = useState("idle");
   const [scannedProduct, setScannedProduct] = useState(null);
   const [scanError, setScanError] = useState("");
   const [form, setForm] = useState({ name: "", cals: "", p: "", c: "", f: "" });
+  const [showTargetEditor, setShowTargetEditor] = useState(false);
+  const [targets, setTargets] = useLocalStorage("fittrack_macro_targets", initialTargets);
+  const [savedMeals, setSavedMeals] = useLocalStorage("fittrack_saved_meals", []);
+  const [saveMealModal, setSaveMealModal] = useState(false);
+  const [saveMealName, setSaveMealName] = useState("");
+  const [saveMealSection, setSaveMealSection] = useState("");
+  const [showSavedMeals, setShowSavedMeals] = useState(false);
+
+  const calcCalories = (p, c, f) => Math.round((p * 4) + (c * 4) + (f * 9));
+
+  const updateMacro = (field, val) => {
+    const num = parseFloat(val) || 0;
+    setTargets(t => {
+      const updated = { ...t, [field]: num };
+      updated.calories = calcCalories(
+        field === "protein" ? num : updated.protein,
+        field === "carbs" ? num : updated.carbs,
+        field === "fat" ? num : updated.fat
+      );
+      return updated;
+    });
+  };
+
+  // Current day's log
+  const log = weekLogs[selectedDate] || [];
+  const setLog = (updater) => {
+    setWeekLogs(wl => ({ ...wl, [selectedDate]: typeof updater === "function" ? updater(wl[selectedDate] || []) : updater }));
+  };
 
   const totals = log.reduce((a, i) => ({ cals: a.cals + (i.cals || 0), p: a.p + (i.p || 0), c: a.c + (i.c || 0), f: a.f + (i.f || 0) }), { cals: 0, p: 0, c: 0, f: 0 });
 
+  // Generate 7-day strip centred on today
+  const weekDays = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - 3 + i);
+    return d.toISOString().split("T")[0];
+  });
+
   const lookupBarcode = async (code) => {
-    setScanning(false);
-    setScanState("loading");
-    setScanError("");
+    setScanning(false); setScanState("loading"); setScanError("");
     try {
       const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${code}.json`);
       const data = await res.json();
-      if (data.status !== 1 || !data.product) { setScanState("error"); setScanError("Product not found in database. Try another barcode or add manually."); return; }
-      const p = data.product;
-      const n = p.nutriments || {};
+      if (data.status !== 1 || !data.product) { setScanState("error"); setScanError("Product not found. Try another barcode or add manually."); return; }
+      const p = data.product; const n = p.nutriments || {};
       const per = n["energy-kcal_serving"] !== undefined ? "serving" : "100g";
       const suffix = per === "serving" ? "_serving" : "_100g";
       const kcal = Math.round(n[`energy-kcal${suffix}`] || n["energy-kcal"] || (n[`energy${suffix}`] || 0) / 4.184 || 0);
-      const servingSize = p.serving_size || (per === "100g" ? "100g" : "1 serving");
-      setScannedProduct({
-        name: p.product_name || p.abbreviated_product_name || "Unknown Product",
-        brand: p.brands || "",
-        servingSize,
-        cals: kcal,
-        p: Math.round((n[`proteins${suffix}`] || n.proteins || 0) * 10) / 10,
-        c: Math.round((n[`carbohydrates${suffix}`] || n.carbohydrates || 0) * 10) / 10,
-        f: Math.round((n[`fat${suffix}`] || n.fat || 0) * 10) / 10,
-      });
+      setScannedProduct({ name: p.product_name || "Unknown Product", brand: p.brands || "", servingSize: p.serving_size || (per === "100g" ? "100g" : "1 serving"), cals: kcal, p: Math.round((n[`proteins${suffix}`] || n.proteins || 0) * 10) / 10, c: Math.round((n[`carbohydrates${suffix}`] || n.carbohydrates || 0) * 10) / 10, f: Math.round((n[`fat${suffix}`] || n.fat || 0) * 10) / 10 });
       setScanState("found");
-    } catch {
-      setScanState("error");
-      setScanError("Network error — check your connection and try again.");
-    }
+    } catch { setScanState("error"); setScanError("Network error — try again."); }
   };
 
   const addFood = () => {
-    if (!form.name) return;
-    setLog(l => [...l, { name: form.name, cals: +form.cals || 0, p: +form.p || 0, c: +form.c || 0, f: +form.f || 0 }]);
-    setForm({ name: "", cals: "", p: "", c: "", f: "" }); setModal(false);
+    const p = +form.p || 0, c = +form.c || 0, f = +form.f || 0;
+    const autoCals = form.cals ? +form.cals : calcCalories(p, c, f);
+    setLog(l => [...l, { name: form.name || "Food", cals: autoCals, p, c, f, meal: activeMeal }]);
+    setForm({ name: "", cals: "", p: "", c: "", f: "" }); setShowManual(false); setAddModal(false);
   };
 
   const addScanned = (item) => {
-    setLog(l => [...l, item]);
+    setLog(l => [...l, { ...item, meal: activeMeal }]);
     setScannedProduct(null); setScanState("idle");
+  };
+
+  const addSavedMeal = (saved) => {
+    setLog(l => [...l, ...saved.items.map(i => ({ ...i, meal: activeMeal }))]);
+    setShowSavedMeals(false); setAddModal(false);
+  };
+
+  const saveCurrentMeal = () => {
+    if (!saveMealName.trim()) return;
+    const items = log.filter(i => i.meal === saveMealSection);
+    if (!items.length) return;
+    setSavedMeals(s => [...s, { id: Date.now(), name: saveMealName.trim(), section: saveMealSection, items }]);
+    setSaveMealModal(false); setSaveMealName("");
   };
 
   const MacroBar = ({ val, max, color }) => (
     <div className="macro-bar-wrap"><div className="macro-bar" style={{ width: `${Math.min(100, (val / max) * 100)}%`, background: color }} /></div>
   );
 
+  const isToday = selectedDate === today();
+  const dateLabel = isToday ? "Today" : new Date(selectedDate + "T12:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+
   return (
     <div>
       <div className="page-header"><div className="page-title">NUTRITION<span className="accent-dot">.</span></div></div>
 
-      {/* TOTALS */}
-      <div className="card">
-        <div className="card-label">Today's Calories</div>
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 8, marginBottom: 8 }}>
-          <span style={{ fontFamily: "'Bebas Neue'", fontSize: 56, color: "var(--accent)", lineHeight: 1 }}>{totals.cals}</span>
-          <span style={{ color: "var(--muted)", fontSize: 14, paddingBottom: 8 }}>/ {macroTargets.calories} kcal</span>
-        </div>
-        <MacroBar val={totals.cals} max={macroTargets.calories} color="var(--accent)" />
-        <div className="macro-row" style={{ marginTop: 16 }}>
-          {[["Protein", totals.p, macroTargets.protein, "#44ff88", "g"], ["Carbs", totals.c, macroTargets.carbs, "#47c5ff", "g"], ["Fat", totals.f, macroTargets.fat, "#ff6b35", "g"]].map(([n, v, t, c, u]) => (
-            <div key={n} className="macro-box">
-              <div className="macro-val" style={{ color: c }}>{v}{u}</div>
-              <div className="macro-name">{n}</div>
-              <MacroBar val={v} max={t} color={c} />
-            </div>
-          ))}
+      {/* ── WEEK STRIP ── */}
+      <div style={{ padding: "0 20px 12px", overflowX: "auto" }}>
+        <div style={{ display: "flex", gap: 6, minWidth: "max-content" }}>
+          {weekDays.map(d => {
+            const dayLog = weekLogs[d] || [];
+            const dayCals = dayLog.reduce((a, i) => a + (i.cals || 0), 0);
+            const isSelected = d === selectedDate;
+            const isTdy = d === today();
+            const dd = new Date(d + "T12:00:00");
+            return (
+              <button key={d} onClick={() => setSelectedDate(d)}
+                style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "8px 10px", borderRadius: 10, border: `1px solid ${isSelected ? "var(--accent)" : "var(--border)"}`, background: isSelected ? "rgba(232,255,71,0.1)" : "var(--surface)", cursor: "pointer", minWidth: 52, gap: 2 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: isSelected ? "var(--accent)" : "var(--muted)", textTransform: "uppercase" }}>{dd.toLocaleDateString("en-GB", { weekday: "short" })}</div>
+                <div style={{ fontFamily: "'Bebas Neue'", fontSize: 20, color: isSelected ? "var(--accent)" : "var(--text)", lineHeight: 1 }}>{dd.getDate()}</div>
+                {isTdy && <div style={{ width: 4, height: 4, borderRadius: "50%", background: "var(--accent)" }} />}
+                {dayCals > 0 && <div style={{ fontSize: 9, color: "var(--muted)", fontWeight: 600 }}>{dayCals}</div>}
+              </button>
+            );
+          })}
         </div>
       </div>
 
-      {/* SCAN LOADING / ERROR STATE */}
+      {/* ── TOTALS ── */}
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div>
+            <div className="card-label" style={{ margin: 0 }}>{dateLabel}</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>Calories</div>
+          </div>
+          <button onClick={() => setShowTargetEditor(e => !e)}
+            style={{ background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--muted)", fontSize: 11, fontWeight: 700, fontFamily: "'DM Sans', sans-serif", padding: "3px 8px", cursor: "pointer" }}>
+            {showTargetEditor ? "Done" : "Edit Targets"}
+          </button>
+        </div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontFamily: "'Bebas Neue'", fontSize: 56, color: "var(--accent)", lineHeight: 1 }}>{totals.cals}</span>
+          <span style={{ color: "var(--muted)", fontSize: 14, paddingBottom: 8 }}>/ {targets.calories} kcal</span>
+          <span style={{ fontFamily: "'Bebas Neue'", fontSize: 20, color: totals.cals > targets.calories ? "var(--danger)" : "var(--green)", lineHeight: 1, paddingBottom: 6, marginLeft: "auto" }}>
+            {totals.cals > targets.calories ? `+${totals.cals - targets.calories} over` : `${targets.calories - totals.cals} left`}
+          </span>
+        </div>
+        <MacroBar val={totals.cals} max={targets.calories} color="var(--accent)" />
+        <div className="macro-row" style={{ marginTop: 16 }}>
+          {[["Protein", totals.p, targets.protein, "#44ff88"], ["Carbs", totals.c, targets.carbs, "#47c5ff"], ["Fat", totals.f, targets.fat, "#ff6b35"]].map(([n, v, t, c]) => {
+            const rem = Math.max(0, t - v); const over = v > t;
+            return (
+              <div key={n} className="macro-box">
+                <div className="macro-val" style={{ color: c }}>{v}g</div>
+                <div className="macro-name">{n}</div>
+                <MacroBar val={v} max={t} color={c} />
+                <div style={{ fontSize: 10, color: over ? "var(--danger)" : "var(--muted)", marginTop: 4, fontWeight: 600 }}>
+                  {over ? `+${Math.round(v - t)}g over` : `${Math.round(rem)}g left`}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {showTargetEditor && (
+          <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Daily Targets — calories auto-calculated</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 8 }}>
+              {[["Protein (g)", "protein", "#44ff88"], ["Carbs (g)", "carbs", "#47c5ff"], ["Fat (g)", "fat", "#ff6b35"]].map(([label, field, color]) => (
+                <div key={field}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 4 }}>{label}</div>
+                  <input className="set-input" type="number" value={targets[field]} onChange={e => updateMacro(field, e.target.value)} style={{ width: "100%", borderColor: color + "44" }} />
+                </div>
+              ))}
+            </div>
+            <div style={{ background: "var(--surface2)", borderRadius: 8, padding: "10px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>= Daily Calories</span>
+              <span style={{ fontFamily: "'Bebas Neue'", fontSize: 28, color: "var(--accent)", lineHeight: 1 }}>{targets.calories} kcal</span>
+            </div>
+            <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6, textAlign: "center" }}>Protein × 4 + Carbs × 4 + Fat × 9</div>
+          </div>
+        )}
+      </div>
+
+      {/* SCAN STATES */}
       {scanState === "loading" && (
         <div className="card" style={{ textAlign: "center", padding: 24 }}>
-          <div style={{ marginBottom: 10 }}>
-            <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
-          </div>
-          <div style={{ fontSize: 14, color: "var(--muted)" }}>Looking up product...</div>
+          <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
+          <div style={{ fontSize: 14, color: "var(--muted)", marginTop: 8 }}>Looking up product...</div>
         </div>
       )}
       {scanState === "error" && (
@@ -1316,62 +1436,156 @@ function NutritionPage({ log, setLog, macroTargets }) {
           <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 12 }}>{scanError}</div>
           <div style={{ display: "flex", gap: 8 }}>
             <button className="btn btn-secondary btn-sm" onClick={() => setScanning(true)}>Scan Again</button>
-            <button className="btn btn-secondary btn-sm" onClick={() => { setScanState("idle"); setModal(true); }}>Add Manually</button>
+            <button className="btn btn-secondary btn-sm" onClick={() => { setScanState("idle"); setShowManual(true); setAddModal(true); }}>Add Manually</button>
             <button className="btn btn-secondary btn-sm" onClick={() => setScanState("idle")}>Dismiss</button>
           </div>
         </div>
       )}
 
-      {/* FOOD LOG */}
-      <div className="card">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-          <div className="card-label" style={{ margin: 0 }}>Food Log</div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-secondary btn-sm" style={{ borderColor: "var(--accent2)", color: "var(--accent2)" }}
-              onClick={() => { setScanState("idle"); setScanning(true); }}>
-              📷 Scan
-            </button>
-            <button className="btn btn-primary btn-sm" onClick={() => setModal(true)}>+ Manual</button>
-          </div>
-        </div>
-        {log.length === 0 && <div className="empty-state">No food logged yet — scan a barcode or add manually!</div>}
-        {log.map((item, i) => (
-          <div key={i} className="food-item">
-            <div>
-              <div className="food-name">{item.name}</div>
-              <div className="food-cals">P: {item.p}g · C: {item.c}g · F: {item.f}g</div>
+      {/* ── MEAL SECTIONS ── */}
+      {["Breakfast", "Lunch", "Dinner", "Snacks"].map(meal => {
+        const mealItems = log.filter(i => i.meal === meal);
+        const mealCals = mealItems.reduce((a, i) => a + (i.cals || 0), 0);
+        const hasSaved = savedMeals.some(s => s.section === meal);
+        return (
+          <div key={meal} className="card">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: mealItems.length ? 10 : 0 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 15 }}>{meal}</div>
+                {mealCals > 0 && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{mealCals} kcal</div>}
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                {mealItems.length > 0 && (
+                  <button className="btn btn-secondary btn-sm" style={{ fontSize: 11 }}
+                    onClick={() => { setSaveMealSection(meal); setSaveMealModal(true); }}>
+                    💾 Save
+                  </button>
+                )}
+                <button className="btn btn-secondary btn-sm" onClick={() => { setActiveMeal(meal); setAddModal(true); setShowManual(false); setShowSavedMeals(false); }}>+ Add</button>
+              </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span className="food-cals" style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>{item.cals} kcal</span>
-              <button className="btn btn-sm" style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: 16 }} onClick={() => setLog(l => l.filter((_, j) => j !== i))}>✕</button>
-            </div>
+            {mealItems.map((item, i) => (
+              <div key={i} className="food-item">
+                <div>
+                  <div className="food-name">{item.name}</div>
+                  <div className="food-cals">P: {item.p}g · C: {item.c}g · F: {item.f}g</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{item.cals} kcal</span>
+                  <button className="btn btn-sm" style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: 16 }}
+                    onClick={() => setLog(l => l.filter(x => x !== item))}>✕</button>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        );
+      })}
 
-      {/* SCANNER */}
+      {/* ── SCANNER ── */}
       {scanning && <BarcodeScanner onDetected={lookupBarcode} onClose={() => setScanning(false)} />}
-
-      {/* PRODUCT CONFIRM */}
       {scanState === "found" && scannedProduct && (
         <ProductConfirm product={scannedProduct} onAdd={addScanned} onClose={() => { setScannedProduct(null); setScanState("idle"); }} />
       )}
 
-      {/* MANUAL ADD MODAL */}
-      {modal && (
-        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setModal(false)}>
+      {/* ── ADD ITEM MODAL ── */}
+      {addModal && (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setAddModal(false)}>
           <div className="modal">
-            <div className="modal-title">ADD FOOD</div>
-            <div className="input-group"><label className="input-label">Name</label><input className="text-input" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Chicken & Rice" /></div>
-            <div className="flex-row">
-              <div className="input-group"><label className="input-label">Calories</label><input className="text-input" type="number" value={form.cals} onChange={e => setForm(f => ({ ...f, cals: e.target.value }))} placeholder="0" /></div>
-              <div className="input-group"><label className="input-label">Protein (g)</label><input className="text-input" type="number" value={form.p} onChange={e => setForm(f => ({ ...f, p: e.target.value }))} placeholder="0" /></div>
+            <div className="modal-title">{activeMeal}</div>
+
+            {!showManual && !showSavedMeals ? (
+              <>
+                <button className="btn btn-primary" style={{ marginBottom: 10 }}
+                  onClick={() => { setAddModal(false); setScanState("idle"); setScanning(true); }}>
+                  📷 Scan Barcode
+                </button>
+                <button className="btn btn-secondary" style={{ width: "100%", marginBottom: 10 }}
+                  onClick={() => setShowManual(true)}>
+                  ✏️ Add Manually
+                </button>
+                {savedMeals.length > 0 && (
+                  <button className="btn btn-secondary" style={{ width: "100%", marginBottom: 10 }}
+                    onClick={() => setShowSavedMeals(true)}>
+                    ⭐ Saved Meals
+                  </button>
+                )}
+                <button className="btn btn-secondary" style={{ width: "100%" }} onClick={() => setAddModal(false)}>Cancel</button>
+              </>
+            ) : showSavedMeals ? (
+              <>
+                <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12 }}>Tap a saved meal to add all its items to {activeMeal}</div>
+                {savedMeals.map((s, i) => (
+                  <div key={s.id} className="food-item" style={{ cursor: "pointer" }} onClick={() => addSavedMeal(s)}>
+                    <div>
+                      <div className="food-name">{s.name}</div>
+                      <div className="food-cals">{s.items.length} items · {s.items.reduce((a, x) => a + x.cals, 0)} kcal</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ color: "var(--accent)", fontSize: 18 }}>+</span>
+                      <button className="btn btn-sm" style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: 14 }}
+                        onClick={e => { e.stopPropagation(); setSavedMeals(m => m.filter((_, j) => j !== i)); }}>✕</button>
+                    </div>
+                  </div>
+                ))}
+                <button className="btn btn-secondary" style={{ width: "100%", marginTop: 12 }} onClick={() => setShowSavedMeals(false)}>← Back</button>
+              </>
+            ) : (
+              <>
+                <div className="input-group">
+                  <label className="input-label">Name (optional)</label>
+                  <input className="text-input" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Chicken & Rice" />
+                </div>
+                <div className="flex-row">
+                  <div className="input-group">
+                    <label className="input-label">Protein (g)</label>
+                    <input className="text-input" type="number" value={form.p} onChange={e => setForm(f => ({ ...f, p: e.target.value, cals: "" }))} placeholder="0" />
+                  </div>
+                  <div className="input-group">
+                    <label className="input-label">Carbs (g)</label>
+                    <input className="text-input" type="number" value={form.c} onChange={e => setForm(f => ({ ...f, c: e.target.value, cals: "" }))} placeholder="0" />
+                  </div>
+                  <div className="input-group">
+                    <label className="input-label">Fat (g)</label>
+                    <input className="text-input" type="number" value={form.f} onChange={e => setForm(f => ({ ...f, f: e.target.value, cals: "" }))} placeholder="0" />
+                  </div>
+                </div>
+                <div style={{ background: "var(--surface2)", borderRadius: 8, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "var(--muted)", letterSpacing: "0.08em", textTransform: "uppercase" }}>Calories</div>
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>Auto-calculated · or override</div>
+                  </div>
+                  <div style={{ fontFamily: "'Bebas Neue'", fontSize: 32, color: "var(--accent)", lineHeight: 1 }}>
+                    {form.cals || calcCalories(+form.p || 0, +form.c || 0, +form.f || 0)} kcal
+                  </div>
+                </div>
+                <div className="input-group">
+                  <label className="input-label">Override Calories (optional)</label>
+                  <input className="text-input" type="number" value={form.cals}
+                    onChange={e => setForm(f => ({ ...f, cals: e.target.value }))}
+                    placeholder={String(calcCalories(+form.p || 0, +form.c || 0, +form.f || 0))} />
+                </div>
+                <button className="btn btn-primary" style={{ marginBottom: 10 }} onClick={addFood}>Save</button>
+                <button className="btn btn-secondary" style={{ width: "100%" }} onClick={() => setShowManual(false)}>← Back</button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── SAVE MEAL MODAL ── */}
+      {saveMealModal && (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setSaveMealModal(false)}>
+          <div className="modal">
+            <div className="modal-title">SAVE MEAL</div>
+            <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 12 }}>
+              Saving {log.filter(i => i.meal === saveMealSection).length} items from {saveMealSection}
             </div>
-            <div className="flex-row">
-              <div className="input-group"><label className="input-label">Carbs (g)</label><input className="text-input" type="number" value={form.c} onChange={e => setForm(f => ({ ...f, c: e.target.value }))} placeholder="0" /></div>
-              <div className="input-group"><label className="input-label">Fat (g)</label><input className="text-input" type="number" value={form.f} onChange={e => setForm(f => ({ ...f, f: e.target.value }))} placeholder="0" /></div>
+            <div className="input-group">
+              <label className="input-label">Meal Name</label>
+              <input className="text-input" value={saveMealName} onChange={e => setSaveMealName(e.target.value)} placeholder='e.g. "My Standard Breakfast"' />
             </div>
-            <button className="btn btn-primary" onClick={addFood}>Save Food</button>
+            <button className="btn btn-primary" style={{ marginBottom: 10 }} onClick={saveCurrentMeal}>Save</button>
+            <button className="btn btn-secondary" style={{ width: "100%" }} onClick={() => setSaveMealModal(false)}>Cancel</button>
           </div>
         </div>
       )}
@@ -1388,13 +1602,15 @@ function ProgressPage({ weights, setWeights, prs, setPRs }) {
   const [prForm, setPRForm] = useState({ exercise: "", weight: "", reps: "1", date: today() });
   const [tab, setTab] = useState("weight");
   const [lightbox, setLightbox] = useState(null);
+  const [progressMessage, setProgressMessage] = useState(null);
+  const [showEntries, setShowEntries] = useState(false);
   const fileRef = useRef();
 
-  // convert display value → kg for storage
   const toKg = v => unit === "lbs" ? parseFloat(v) / KG_TO_LBS : parseFloat(v);
-  // convert kg → display
   const fromKg = kg => unit === "lbs" ? Math.round(kg * KG_TO_LBS * 10) / 10 : kg;
   const unitLabel = unit === "lbs" ? "lbs" : "kg";
+
+  const startingWeight = weights.length > 0 ? weights[0].kg : null;
 
   const handlePhotoChange = e => {
     const file = e.target.files[0];
@@ -1406,8 +1622,25 @@ function ProgressPage({ weights, setWeights, prs, setPRs }) {
   const addWeight = () => {
     if (!form.val) return;
     const kg = Math.round(toKg(form.val) * 10) / 10;
-    setWeights(w => [...w, { date: form.date, kg, photoURL: form.photoURL || null }]
-      .sort((a, b) => a.date.localeCompare(b.date)));
+    const newWeights = [...weights, { date: form.date, kg, photoURL: form.photoURL || null }]
+      .sort((a, b) => a.date.localeCompare(b.date));
+    setWeights(newWeights);
+
+    // Show progress message vs starting weight (only if there's a previous entry)
+    if (startingWeight !== null) {
+      const diff = Math.round((kg - startingWeight) * 10) / 10;
+      const diffDisplay = fromKg(Math.abs(diff));
+      if (diff < 0) {
+        setProgressMessage({ type: "loss", text: `🔥 You're down ${diffDisplay}${unitLabel} from your starting weight of ${fromKg(startingWeight)}${unitLabel}. Keep going!` });
+      } else if (diff > 0) {
+        setProgressMessage({ type: "gain", text: `📈 You're up ${diffDisplay}${unitLabel} from your starting weight of ${fromKg(startingWeight)}${unitLabel}. Stay consistent!` });
+      } else {
+        setProgressMessage({ type: "same", text: `💪 Same as your starting weight. Every day counts — keep at it!` });
+      }
+    } else {
+      setProgressMessage({ type: "start", text: `✅ Starting weight logged! This is your baseline — everything from here gets measured against this.` });
+    }
+
     setForm({ val: "", date: today(), photo: null, photoURL: null });
     if (fileRef.current) fileRef.current.value = "";
   };
@@ -1463,40 +1696,131 @@ function ProgressPage({ weights, setWeights, prs, setPRs }) {
       {/* ── WEIGHT TAB ── */}
       {tab === "weight" && (
         <>
+          {/* Starting weight card */}
+          {startingWeight !== null && (
+            <div className="card" style={{ background: "linear-gradient(135deg, #0a1a0a 0%, var(--surface) 100%)", borderColor: "rgba(68,255,136,0.3)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "var(--green)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Starting Weight</div>
+                  <div style={{ fontFamily: "'Bebas Neue'", fontSize: 40, color: "var(--green)", lineHeight: 1 }}>{fromKg(startingWeight)} {unitLabel}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{monthLabel(weights[0].date)}</div>
+                </div>
+                {weights.length > 1 && (() => {
+                  const latest = weights[weights.length - 1].kg;
+                  const diff = Math.round((latest - startingWeight) * 10) / 10;
+                  const isLoss = diff < 0;
+                  return (
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Total Change</div>
+                      <div style={{ fontFamily: "'Bebas Neue'", fontSize: 40, color: isLoss ? "var(--green)" : "var(--danger)", lineHeight: 1 }}>
+                        {isLoss ? "▼" : "▲"} {fromKg(Math.abs(diff))} {unitLabel}
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{weights.length} entries</div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+
+          {/* Progress message — shows after logging */}
+          {progressMessage && (
+            <div className="card" style={{
+              borderColor: progressMessage.type === "loss" ? "var(--green)" : progressMessage.type === "start" ? "var(--accent)" : "var(--accent2)",
+              background: progressMessage.type === "loss" ? "rgba(68,255,136,0.05)" : progressMessage.type === "start" ? "rgba(232,255,71,0.05)" : "rgba(255,107,53,0.05)"
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div style={{ fontSize: 14, lineHeight: 1.6, fontWeight: 500 }}>{progressMessage.text}</div>
+                <button onClick={() => setProgressMessage(null)} style={{ background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: 18, flexShrink: 0 }}>✕</button>
+              </div>
+            </div>
+          )}
+
           <div className="card">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
               <div className="card-label" style={{ margin: 0 }}>Weight Trend</div>
-              {changeDisplay !== null && (
-                <span className={`change-badge ${totalChange < 0 ? "change-down" : "change-up"}`}>
-                  {totalChange < 0 ? "▼" : "▲"} {changeDisplay} {unitLabel}
-                </span>
-              )}
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {changeDisplay !== null && (
+                  <span className={`change-badge ${totalChange < 0 ? "change-down" : "change-up"}`}>
+                    {totalChange < 0 ? "▼" : "▲"} {changeDisplay} {unitLabel}
+                  </span>
+                )}
+                {weights.length > 0 && (
+                  <button onClick={() => setShowEntries(e => !e)}
+                    style={{ background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--muted)", fontSize: 11, fontWeight: 700, fontFamily: "'DM Sans', sans-serif", padding: "3px 8px", cursor: "pointer" }}>
+                    {showEntries ? "Hide" : `All ${weights.length}`}
+                  </button>
+                )}
+              </div>
             </div>
-            <LineChart data={chartData} />
-            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
-              {weights.slice(-4).map((w, i) => (
-                <div key={i} style={{ textAlign: "center", cursor: w.photoURL ? "pointer" : "default" }}
-                  onClick={() => w.photoURL && setLightbox({ url: w.photoURL, date: w.date, weight: w.kg })}>
-                  <div style={{ fontFamily: "'Bebas Neue'", fontSize: 18, color: "var(--accent)" }}>{fromKg(w.kg)}</div>
-                  <div style={{ fontSize: 10, color: "var(--muted)" }}>{monthLabel(w.date)}</div>
-                  {w.photoURL && <div style={{ fontSize: 9, color: "var(--accent2)", marginTop: 2 }}>📷</div>}
-                </div>
-              ))}
+            <div style={{ cursor: weights.length > 0 ? "pointer" : "default" }} onClick={() => weights.length > 0 && setShowEntries(e => !e)}>
+              <LineChart data={chartData} />
             </div>
+
+            {/* Entry list — shown when chart is tapped */}
+            {showEntries && (
+              <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8 }}>All Entries</div>
+                {[...weights].reverse().map((w, i) => {
+                  const isFirst = i === weights.length - 1;
+                  const diffFromStart = startingWeight ? Math.round((w.kg - startingWeight) * 10) / 10 : null;
+                  return (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: i < weights.length - 1 ? "1px solid var(--border)" : "none" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        {w.photoURL && (
+                          <img src={w.photoURL} alt="" style={{ width: 32, height: 32, borderRadius: 6, objectFit: "cover", cursor: "pointer" }}
+                            onClick={() => setLightbox({ url: w.photoURL, date: w.date, weight: w.kg })} />
+                        )}
+                        <div>
+                          <div style={{ fontSize: 13, fontWeight: 600 }}>{monthLabel(w.date)}</div>
+                          {isFirst && <span style={{ fontSize: 10, background: "rgba(68,255,136,0.1)", color: "var(--green)", borderRadius: 4, padding: "1px 5px", fontWeight: 700 }}>START</span>}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        {diffFromStart !== null && !isFirst && (
+                          <span style={{ fontSize: 11, color: diffFromStart < 0 ? "var(--green)" : "var(--danger)", fontWeight: 700 }}>
+                            {diffFromStart < 0 ? "▼" : "▲"}{fromKg(Math.abs(diffFromStart))}{unitLabel}
+                          </span>
+                        )}
+                        <span style={{ fontFamily: "'Bebas Neue'", fontSize: 22, color: "var(--accent)" }}>{fromKg(w.kg)} {unitLabel}</span>
+                        <button onClick={() => setWeights(ws => ws.filter(x => x !== w))}
+                          style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: 14 }}>✕</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {!showEntries && (
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
+                {weights.slice(-4).map((w, i) => (
+                  <div key={i} style={{ textAlign: "center", cursor: w.photoURL ? "pointer" : "default" }}
+                    onClick={() => w.photoURL && setLightbox({ url: w.photoURL, date: w.date, weight: w.kg })}>
+                    <div style={{ fontFamily: "'Bebas Neue'", fontSize: 18, color: "var(--accent)" }}>{fromKg(w.kg)}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted)" }}>{monthLabel(w.date)}</div>
+                    {w.photoURL && <div style={{ fontSize: 9, color: "var(--accent2)", marginTop: 2 }}>📷</div>}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="card">
             <div className="card-label">Log Weight</div>
-            <div className="flex-row">
-              <div className="input-group">
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
                 <label className="input-label">Weight ({unitLabel})</label>
-                <input className="text-input" type="number" step={unit === "lbs" ? "0.1" : "0.1"}
+                <input className="text-input" type="number" step="0.1"
                   placeholder={unit === "lbs" ? "181.4" : "82.5"}
-                  value={form.val} onChange={e => setForm(f => ({ ...f, val: e.target.value }))} />
+                  value={form.val} onChange={e => setForm(f => ({ ...f, val: e.target.value }))}
+                  style={{ textAlign: "center", width: "100%" }} />
               </div>
-              <div className="input-group">
+              <div style={{ flex: 1, minWidth: 0 }}>
                 <label className="input-label">Date</label>
-                <input className="text-input" type="date" value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
+                <input className="text-input" type="date" value={form.date}
+                  onChange={e => setForm(f => ({ ...f, date: e.target.value }))}
+                  style={{ width: "100%", fontSize: 12, padding: "11px 4px", textAlign: "center", boxSizing: "border-box" }} />
               </div>
             </div>
 
@@ -1847,13 +2171,13 @@ const NAV = [
 export default function App() {
   const [page, setPage] = useState("home");
 
-  // ── Shared state lifted to root so Dashboard can read real data ──
-  const [userName, setUserName] = useState("Nathan");
-  const [macroTargets, setMacroTargets] = useState(DEFAULT_MACRO_TARGETS);
-  const [history, setHistory] = useState([]);       // workout history
-  const [weights, setWeights] = useState([]);       // bodyweight entries
-  const [prs, setPRs] = useState([]);               // personal records
-  const [todayLog, setTodayLog] = useState([]);     // today's food log
+  // ── All key data persisted to localStorage ──
+  const [userName, setUserName] = useLocalStorage("fittrack_username", "Nathan");
+  const [macroTargets, setMacroTargets] = useLocalStorage("fittrack_macro_targets", DEFAULT_MACRO_TARGETS);
+  const [history, setHistory] = useLocalStorage("fittrack_history", []);
+  const [weights, setWeights] = useLocalStorage("fittrack_weights", []);
+  const [prs, setPRs] = useLocalStorage("fittrack_prs", []);
+  const [todayLog, setTodayLog] = useLocalStorage("fittrack_today_log", []);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const saveSettings = (name, macros) => {
